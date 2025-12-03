@@ -1,0 +1,102 @@
+#######################################
+# OS / Editor
+#######################################
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+.vscode/
+.idea/
+*.swp
+*.swo
+
+#######################################
+# Python
+#######################################
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.cache/
+
+#######################################
+# Virtualenv
+#######################################
+.venv/
+venv/
+ENV/
+env/
+
+#######################################
+# Python build / packaging
+#######################################
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+#######################################
+# Test / coverage
+#######################################
+.coverage
+coverage.xml
+htmlcov/
+.junit.xml
+.testmondata*
+.pytest_tmp/
+.tox/
+.nox/
+
+#######################################
+# Logs
+#######################################
+*.log
+logs/
+*.out
+
+#######################################
+# Env files / secrets (IMPORTANT)
+#######################################
+.env
+.env.*
+!.env.example
+
+#######################################
+# Data / uploads (your project writes files here)
+#######################################
+data/
+uploads/
+*.xlsx
+*.xls
+*.csv
+
+#######################################
+# Database dumps / local DB artifacts
+#######################################
+*.sql
+*.sqlite
+*.sqlite3
+
+#######################################
+# Node / Vue (if frontend exists in same repo)
+#######################################
+node_modules/
+dist/
+.vite/
+.npmrc
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+#######################################
+# Misc
+#######################################
+*.bak
+*.tmp

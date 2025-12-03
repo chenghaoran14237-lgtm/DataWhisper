@@ -1,0 +1,292 @@
+下面给你一份我已经“按你刚才那段评审意见”打磨过的 **DataWhisper（Excel Agent）开发档案 v1.1（可交接/可复刻）**。它的写法是：**能确定的写成事实+位置**；不能确定的全部标成**约定/待核对**，避免未来误导。
+
+---
+
+# DataWhisper（Excel Agent）开发档案 v1.1（可交接/可复刻）
+
+## 0. 这是什么（项目一句话）
+
+用户上传 `.xlsx` → 后端读成 `pandas.DataFrame` → Planner 生成工具链（groupby/sum/sort/chart…）执行 → LLM **只基于工具输出**写解释性回复 → 返回 `reply + artifacts(chart spec…)`，并把对话与 debug trace 写入 MySQL，供复盘与前端展示。 
+
+---
+
+## 1. “事实 vs 约定”的标记规则（防止你未来被自己坑）
+
+* ✅ **已实现/已在运行中出现过的事实**：我会写清楚“位置：app/xxx.py”（来源：你跑 uvicorn/pytest 的栈信息、你贴过的代码片段）。
+* 📌 **项目约定（希望系统就该这样）**：对外合同/规范可以先写约定，但会明确它是契约，不冒充事实。
+* ⚠️ **待核对（需要你打开仓库确认）**：我会写“TODO: 以实际代码为准”。
+
+---
+
+## 2. 运行环境与一键复刻（强约束：可复现）
+
+### 2.1 项目路径（事实）
+
+* Windows 后端路径：`C:\DataWhisper\backend`（你一直在此目录运行 pytest/uvicorn）
+
+### 2.2 Python 版本（待补：必须写“实际输出”）
+
+* ⚠️ TODO 写入：`python --version` 的真实输出（不要“从报错推断”——你自己已经踩过这种坑）
+
+### 2.3 依赖锁定（迁移最容易翻车的点）
+
+📌 约定：仓库根目录必须包含以下其一：
+
+* `requirements.txt`（推荐 demo 项目）或 `pyproject.toml/poetry.lock`
+
+📌 推荐生成方式（Windows PowerShell）：
+
+```powershell
+# 在 backend 目录
+python -m venv .venv
+.\.venv\Scripts\activate
+python -m pip install -U pip
+pip install -r requirements.txt
+```
+
+⚠️ TODO（冻结版本时填入）：
+
+* `pip freeze > requirements.txt`
+* 在档案里附上 “关键依赖 pinned 版本”（fastapi/sqlalchemy/pydantic/pandas/aiomysql/openpyxl/httpx/pytest/pytest-asyncio 等）
+
+> 你之前遇到过：`aiomysql` 缺失、`cryptography` 缺失导致 MySQL `caching_sha2_password` 认证失败——这类问题 90% 都是版本/依赖没锁好引发的。
+
+---
+
+## 3. MySQL 初始化（把“能跑起来”写成脚本）
+
+### 3.1 数据库（事实/约定混合）
+
+* ✅ 项目使用 `DATABASE_URL` 环境变量连接 MySQL（你测试里一直这么配）
+* ✅ 测试库：`datawhisper_test`（pytest 用它 drop/create）
+* 📌 约定字符集：`utf8mb4`
+
+### 3.2 建库/建用户/授权（直接给可复制 SQL）
+
+📌 推荐（本机开发用）：
+
+```sql
+CREATE DATABASE IF NOT EXISTS datawhisper
+  DEFAULT CHARACTER SET utf8mb4
+  DEFAULT COLLATE utf8mb4_unicode_ci;
+
+CREATE DATABASE IF NOT EXISTS datawhisper_test
+  DEFAULT CHARACTER SET utf8mb4
+  DEFAULT COLLATE utf8mb4_unicode_ci;
+
+-- 兼容不同 host：127.0.0.1 / localhost
+CREATE USER IF NOT EXISTS 'datawhisper'@'127.0.0.1' IDENTIFIED BY 'dwpass';
+CREATE USER IF NOT EXISTS 'datawhisper'@'localhost' IDENTIFIED BY 'dwpass';
+
+GRANT ALL PRIVILEGES ON datawhisper.* TO 'datawhisper'@'127.0.0.1';
+GRANT ALL PRIVILEGES ON datawhisper.* TO 'datawhisper'@'localhost';
+GRANT ALL PRIVILEGES ON datawhisper_test.* TO 'datawhisper'@'127.0.0.1';
+GRANT ALL PRIVILEGES ON datawhisper_test.* TO 'datawhisper'@'localhost';
+FLUSH PRIVILEGES;
+```
+
+📌 解释：你提到的“127.0.0.1 vs localhost” host 匹配问题，是 MySQL 权限模型的经典坑；这里直接双写兜底。
+
+---
+
+## 4. 数据表结构（字段级，避免“概念交接”）
+
+> 下面是**档案层面的字段契约**，来源于你的结构文档；上线前请用 ORM 真实字段对齐并在每张表后面补“位置：app/models/xxx.py”。 
+
+### 4.1 messages（对话消息表）
+
+📌 字段（约定） 
+
+* `id` UUID
+* `session_id` UUID（建议建索引）
+* `role` string：`user|assistant|system`
+* `content` text
+* `created_at` datetime
+* `summarized` bool
+* `token_count` int（可选）
+* `extra` JSON（关键：存 debug/artifacts 等）
+
+📌 extra 约定（白名单，务必固定 key，前端和测试都靠它）：
+
+```json
+{
+  "debug": {
+    "plan": [{"tool":"groupby_sum","args":{}}],
+    "tool_trace": [{"tool":"groupby_sum","args":{},"output_kind":"table","output_preview":"..."}],
+    "artifacts": [{"kind":"chart","spec":{}}],
+    "profile": {"rows": 123, "cols": 7, "columns": ["a","b"]}
+  }
+}
+```
+
+### 4.2 summaries（对话摘要表）
+
+📌 字段（约定） 
+
+* `id` UUID
+* `session_id` UUID（建议索引）
+* `content` text
+* `up_to_message_id` UUID
+* `created_at` datetime
+
+---
+
+## 5. 配置与 Settings（你曾经在这里踩大坑：重复 class 导致找不到字段）
+
+### 5.1 事实（你遇到的报错说明了什么）
+
+你跑 `uvicorn app.main:app --reload` 时出现过：
+
+* `Settings` 没有 `app_name`
+* `Settings` 没有 `api_prefix`
+
+这类报错几乎必然由 **Settings 定义重复/覆盖** 或 “字段名与 alias 不一致”造成。
+
+### 5.2 📌 约定：Settings 只保留一个 class，字段统一（建议模板）
+
+（这是“档案给未来维护者”的硬规则）
+
+* 只定义一个 `class Settings(BaseSettings)`
+* 所有 env key 用 `alias=...` 显式绑定
+* `get_settings()` 用 `@lru_cache` 缓存
+* `extra="ignore"` 防止 .env 多写字段直接炸
+
+（你把两个 Settings 合并成一个就能避免再次出现 “没有 api_prefix/app_name”。）
+
+---
+
+## 6. 后端核心链路（函数级“业务怎么跑起来”）
+
+下面是你 Excel Agent 的“黄金路径”，也是前端接入时必须懂的链路： 
+
+### 6.1 上传：POST `/api/excel/upload`
+
+📌 目标：把 Excel 落盘 + 入库 file_uploads + 返回 `session_id/upload_id`
+
+* 入口（事实，来自栈信息）：`位置：app/api/excel_api.py`
+* 业务（约定，和你的设计一致）：ExcelService 做校验/存储/读表/缓存 
+
+### 6.2 对话：POST `/api/excel/chat`
+
+📌 请求响应（约定） 
+
+* Request: `{session_id, upload_id, message}`
+* Response: `{reply, session_id, upload_id, artifacts: []}`
+
+  > artifacts 必须永远是 list（你已经在 schema 里这么做了）
+
+📌 执行步骤（约定 + 你项目实际实现风格一致） 
+
+1. ConversationService：写入 user message、拉取 summary+近期消息（位置待你补） 
+2. ExcelService：ensure_cached / 读取 DataFrame 与 profile（位置：你贴过 `ExcelService.ensure_cached` 被调用）
+3. AgentService：
+
+   * `plan_tools(df, question)` 产出工具调用序列（你现在是真多步：趋势会出现 groupby/sort/chart/head）
+   * `build_default_registry()` 拿到工具注册表（位置：app/services/tools/default_registry.py）
+   * 逐个执行工具，生成 `tool_trace` 与 `artifacts`（你现在已经支持 chart 工具输出）
+4. LLMService/LLMProvider：
+
+   * `get_llm_provider()`：fake/openai 可插拔（你现在已经接入 env provider 的思路） 
+5. ConversationService：写入 assistant message（extra.debug）并判断是否触发 summary
+
+---
+
+## 7. artifacts / chart spec（必须“唯一规范”，不然前端必炸）
+
+### 7.1 📌 唯一规范（交接时只能有一种）
+
+📌 约定：后端所有图表都返回：
+
+```json
+{
+  "kind": "chart",
+  "spec": {
+    "type": "line",
+    "x": ["Jan","Feb","Mar"],
+    "series": [
+      {"name": "sales", "data": [10, 20, 5]}
+    ]
+  }
+}
+```
+
+### 7.2 关键语义（和你测试期望对齐）
+
+* `data` 允许 `null`：缺失值**必须保留为 null**，不能变 0（你有专门的测试覆盖这个点）
+* `x` 与 `series[*].data` 长度必须一致
+* `artifacts` 永远是 list（无图时返回空 list）
+
+⚠️ TODO：把该规范对齐到真实实现（位置应该在 `app/services/tools/pandas_tools.py` 里那些 `chart_line*` 工具函数里）。
+
+---
+
+## 8. 错误响应契约（给前端/协作者最省命）
+
+📌 统一错误 schema（就算现在没全实现，也先立规矩）：
+
+```json
+{
+  "code": "upload_too_large",
+  "detail": "File too large. MAX_UPLOAD_MB=10",
+  "meta": {"max_mb": 10}
+}
+```
+
+📌 `/api/excel/upload` 常见错误
+
+* 400：缺 file / 扩展名非 xlsx
+* 413：超过 MAX_UPLOAD_MB
+* 500：openpyxl/pandas 解析失败
+
+📌 `/api/excel/chat` 常见错误
+
+* 404：session_id / upload_id 不存在
+* 422：请求体缺字段
+* 500：planner 执行失败、LLM 调用失败、DB 写入失败
+
+---
+
+## 9. Quickstart（从 0 到跑通）
+
+📌 最短黄金路径（你交接给别人时就让他照做）
+
+1. 配 `.env`（提供 `.env.example`，含 DATABASE_URL、ENV、DATA_DIR、LLM_PROVIDER 等）
+2. 初始化 MySQL（执行上面的建库授权 SQL）
+3. 跑测试：
+
+```powershell
+pytest -q
+```
+
+4. 启动：
+
+```powershell
+uvicorn app.main:app --reload
+```
+
+5. 走一遍 upload → chat（Swagger 或前端）
+
+---
+
+## 10. 故障剧本（你已经踩过的坑，写进档案就是“经验资产”）
+
+* `ModuleNotFoundError: aiomysql`：依赖没装/没锁
+* `cryptography package is required... caching_sha2_password`：装 `cryptography` 或调整 MySQL auth plugin
+* `Event loop is closed`（pytest 结束时 aiomysql 连接析构）：一般是连接没显式 close；可通过 fixture/engine dispose 收敛
+* `pytest_asyncio STRICT` 警告/错误：pytest-asyncio 模式/fixture 不匹配
+* `tool already registered: chart_line_index`：registry 重复注册（default_registry 里重复 register）
+* planner 产出的 tool 名 mismatch（例如测试期待 `sort`，实际是 `sort_time`）：统一 tool 命名或做 alias
+
+---
+
+# 11. 你要做的“冻结 v1.1 的最后 5 件小事”（强烈建议）
+
+1. 把 Python 版本、requirements 锁文件写死（真实输出/真实文件名）
+2. 每个关键断言后补“位置：app/...”
+3. artifacts spec **只保留一种**，并以工具实现为准
+4. 错误 schema 统一（前端才好写）
+5. 增加一个可复制的 curl/httpx 端到端 demo（upload+chat）
+
+---
+
+如果你确认这份 v1.1 档案风格/颗粒度符合你的“删聊天记录仍可接手”目标，我就开始做**第 3 件事：简历项目介绍（并标注哪些是库函数、哪些是你自己写的）**。

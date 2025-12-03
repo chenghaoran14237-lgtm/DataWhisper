@@ -1,0 +1,32 @@
+/* src/style.css */
+:root {
+  /* Logo 提取色：深空灰与脉冲蓝 */
+  --dw-bg-dark: #1a1b26;        
+  --dw-card-bg: #242636;        
+  --dw-accent-blue: #5e7ce2;    
+  --dw-accent-glow: rgba(94, 124, 226, 0.4); 
+  --dw-text-main: #eef1f5;
+  --dw-text-sub: #a0aec0;
+  
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  background-color: var(--dw-bg-dark);
+  color: var(--dw-text-main);
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+/* 覆盖 Element Plus 的默认样式，让它变暗 */
+:root {
+  --el-color-primary: var(--dw-accent-blue);
+  --el-bg-color: var(--dw-bg-dark);
+  --el-text-color-primary: var(--dw-text-main);
+  --el-border-color-light: rgba(255,255,255,0.1);
+}
+
+/* 滚动条美化 */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #4a5568; border-radius: 4px; }
+::-webkit-scrollbar-track { background: var(--dw-bg-dark); }

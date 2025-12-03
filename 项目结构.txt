@@ -1,0 +1,386 @@
+AI Excel Assistant — Backend Technical Specification
+
+（系统架构 & 模块职责文档）
+
+本项目旨在构建一个基于 Web 的 Excel 智能分析助手。用户通过网页上传 Excel 文件并提出自然语言需求，后端利用 FastAPI、pandas 及 LLM（OpenAI API）实现数据分析、对话记忆、多轮任务管理与智能生成。
+
+系统核心包括三大部分：
+
+前端（Web Shell）：轻量 UI，用于上传文件与发送指令
+
+后端（业务核心）：会话管理、Excel 工具调用、LLM 编排
+
+LLM 服务（OpenAI API）：对话生成、摘要生成、意图识别等
+
+本文档描述项目结构、模块划分及各组件职责。
+
+1. Overall Architecture
+
+系统采用典型的三层架构：API 层、服务层（业务逻辑层）、基础设施层。
+
+┌─────────────────────────────────────┐
+│               Frontend              │
+│     - File Upload UI                │
+│     - Chat Interface                │
+└─────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────┐
+│                 API                 │
+│  FastAPI HTTP Endpoints             │
+└─────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────┬──────────────────────────────┐
+│               Services              │             Infra             │
+│ - Conversation Service              │ - DB Models                   │
+│ - Excel Service                     │ - Storage / File System       │
+│ - Agent (LLM Orchestration)         │ - LLM Client (OpenAI)         │
+│ - Summary Engine                    │ - Config, Logging             │
+└─────────────────────────────────────┴──────────────────────────────┘
+
+
+后端负责所有对话逻辑、记忆管理、数据分析、模型调度及任务状态。
+
+2. Directory Structure
+
+以下为推荐的 Python 项目结构：
+
+app/
+├── api/
+│   ├── excel_api.py           # 文件上传、Excel 会话入口
+│   ├── chat_api.py            # 通用聊天入口（可选）
+│   └── __init__.py
+│
+├── services/
+│   ├── conversation_service.py  # 会话与消息管理
+│   ├── summary_service.py       # 对话摘要生成
+│   ├── excel_service.py         # Excel 文件读取与数据处理
+│   ├── agent_service.py         # Excel 智能分析 Agent（核心业务）
+│   └── llm_service.py           # LLM 客户端封装
+│
+├── models/
+│   ├── message.py             # ORM: messages 表
+│   ├── session.py             # ORM: sessions 表
+│   ├── summary.py             # ORM: summaries 表
+│   ├── file_upload.py         # ORM: file_uploads 表
+│   └── __init__.py
+│
+├── core/
+│   ├── config.py              # 环境变量、模型配置
+│   ├── database.py            # DB 连接与 Session 管理
+│   ├── logging.py             # 日志配置
+│   └── exceptions.py          # 自定义异常
+│
+├── utils/
+│   ├── token_utils.py         # token 估算工具
+│   ├── file_utils.py          # 文件存储工具
+│   └── df_utils.py            # DataFrame 辅助函数
+│
+└── main.py                    # FastAPI 启动入口
+
+3. Database Schema & Model Responsibilities
+
+系统共包含四张核心表（可随项目扩展）：
+
+3.1 sessions — 会话表
+
+用途：标识一次独立的对话流程（可能对应一个 Excel 分析任务）
+
+字段	类型	描述
+id	UUID	会话唯一标识
+created_at	datetime	会话创建时间
+status	string	active / closed
+current_upload_id	UUID	当前会话绑定的 Excel 文件
+meta	JSON	可扩展元信息
+3.2 file_uploads — 上传文件表
+
+用途：记录用户上传的 Excel 文件及存储位置信息
+
+字段	类型	描述
+id	UUID	文件上传记录 ID
+session_id	UUID	从属的会话
+filename	string	原始文件名
+stored_path	string	文件实际存储路径或对象存储 key
+uploaded_at	datetime	上传时间
+
+DataFrame 数据不存数据库，由后端缓存管理（内存/Redis）。
+
+3.3 messages — 对话消息表
+
+用途：存储每一条 user/assistant 系统消息
+
+字段	类型	描述
+id	UUID	
+session_id	UUID	
+role	string	user / assistant / system
+content	text	消息内容
+created_at	datetime	
+summarized	bool	是否已被纳入 summary
+token_count	int	可选：用于 summary 触发条件
+extra	JSON	存 tool 返回的结构化数据等
+3.4 summaries — 对话摘要表
+
+用途：长期压缩记忆，减少 token 消耗
+
+字段	类型	描述
+id	UUID	
+session_id	UUID	
+content	text	摘要内容
+up_to_message_id	UUID	覆盖到的最后 message
+created_at	datetime	
+
+每次构建 LLM prompt 时使用 最新一条 summary + 近期未总结消息。
+
+4. Services (业务核心模块)
+4.1 ConversationService
+
+职责：
+
+新增 user / assistant 消息
+
+查询某会话的完整信息
+
+获取“最近未总结消息”
+
+计算 token 用量
+
+基于阈值判断是否应触发摘要生成
+
+构造发给 LLM 的 messages 列表（拼接 summary + 历史消息 + 当前消息）
+
+核心输出：
+
+build_llm_context(session_id, current_user_text) -> List[messages]
+
+4.2 SummaryService
+
+职责：
+
+当消息累积过多时生成对话摘要
+
+使用较便宜模型（如 GPT-4.1-mini）
+
+标记被总结的旧消息为 summarized = True
+
+写入 summaries 表
+
+核心行为：
+
+generate_summary(session) -> summary_string
+
+4.3 ExcelService
+
+职责：
+
+文件上传校验（类型、大小）
+
+文件存储（本地或对象存储）
+
+读取 Excel → DataFrame
+
+提供基础分析：
+
+列名、类型推断
+
+缺失率统计
+
+前 N 行 sample
+
+提供业务层数据计算方法：
+
+按条件过滤
+
+分组统计
+
+Top-N 计算等
+
+关键点：
+
+DataFrame 不入库，通过缓存（全局 dict / Redis）管理
+excel_cache[upload_id] = DataFrame
+
+4.4 AgentService / ExcelAgent
+
+系统核心：负责智能编排
+
+职责：
+
+接收来自 API 的请求（session_id, upload_id, message）
+
+拉取会话历史（summary + messages）
+
+获取 Excel 数据（DataFrame + 预览）
+
+决定本轮处理策略：
+
+单步处理（简单总结或分析）
+
+多步调用（意图识别 → pandas 分析 → 文本生成）
+
+调用 LLM 生成解释 / 建议
+
+将输出写入 messages 表
+
+返回给 API 层
+
+此模块是整个项目的“智能枢纽”。
+
+4.5 LLMService
+
+职责：
+
+封装 OpenAI API
+
+统一管理：
+
+模型名称
+
+温度
+
+max_tokens
+
+重试策略
+
+提供三个接口：
+
+chat(messages) -> str
+
+summarize(messages) -> str
+
+（可选）classify_intent(...) -> dict
+
+意义：
+
+将来可无缝切换到 DeepSeek、Gemini、本地模型
+
+其它模块无需修改任何逻辑
+
+5. API Endpoints
+
+后端对前端暴露两个核心接口：
+
+5.1 POST /api/excel/upload
+
+功能：上传 Excel 文件
+返回：upload_id
+
+要求：
+
+文件格式校验（必须为 .xlsx）
+
+文件大小限制（例如 < 10MB）
+
+5.2 POST /api/excel/chat
+
+功能：基于上传的 Excel 进行对话分析
+
+请求 JSON：
+
+{
+  "session_id": "...",
+  "upload_id": "...",
+  "message": "请帮我分析销售趋势"
+}
+
+
+响应 JSON：
+
+{
+  "reply": "2024年前三个月销售上升明显……",
+  "session_id": "...",
+  "upload_id": "..."
+}
+
+
+后端执行流程：
+
+写入 user message
+
+拉取 summary + 历史消息
+
+构造 LLM prompt
+
+触发单步或多步智能分析
+
+写入 assistant message
+
+判断是否需要 summary
+
+返回结果
+
+6. Execution Flow (运行时流程图)
+
+以下为一次完整聊天请求的典型后端流程：
+
+User Message
+      │
+      ▼
+API (POST /excel/chat)
+      │
+      ▼
+ConversationService
+  - 插入 user 消息
+  - 获取 summary + 未总结消息
+      │
+      ▼
+ExcelService
+  - 获取 DataFrame / 统计
+      │
+      ▼
+AgentService
+  - 构造上下文
+  - 决定调用策略（单步/多步）
+  - 调用 LLMService
+      │
+      ▼
+LLMService
+  - 调用 OpenAI 并返回文本
+      │
+      ▼
+AgentService
+  - 写入 assistant 消息
+  - 判断是否 summary
+      │
+      ▼
+API 返回给前端
+
+7. Non-Functional Requirements
+
+可扩展性：模块化设计，便于添加更多 agent，如 PDF 分析、代码分析等
+
+安全性：
+
+API Key 仅存从环境变量读取
+
+文件大小限制、防止恶意上传
+
+性能：
+
+使用 DataFrame 缓存避免重复 IO
+
+limit + summary 降低 token 消耗
+
+可维护性：
+
+明确划分 API / Service / Infra 层
+
+LLM 调用统一封装
+
+日志：
+
+记录请求耗时、LLM 报错、Excel 解析异常
+
+8. Summary
+
+本项目后端采用分层结构，将“对话记忆”、“任务状态”、“Excel 工具链”、“LLM 调度”清晰解耦，使系统具备以下特性：
+
+多轮上下文管理
+
+深度 Excel 数据分析
+
+多步 LLM 编排
+
+可插拔模型与业务扩展
+
+稳定、模块化、易维护

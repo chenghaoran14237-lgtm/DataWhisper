@@ -1,0 +1,240 @@
+下面我先做**第 1 件事**：把整个业务流程按“代码真实运行顺序”讲清楚，并且尽量用**函数名**来串起来（不贴完整函数体，只讲它干嘛、怎么协作、覆盖哪些场景）。我会以你们文档里的分层结构为主线：API 层 → Services 层 → Infra/Models 层。 
+
+---
+
+## 0) 这个项目“跑起来”的一条主线（你脑海里要有的图）
+
+**用户上传 Excel → 后端解析成 DataFrame → Planner 规划工具链 → 工具链执行得到可复现结果 → LLM 基于工具结果写解释 → reply + artifacts 返回前端 → 消息/调试 trace 写入 MySQL → 可能触发 summary 压缩上下文**。这正是需求文档里描述的“后端主战场 + 前端壳子”的分工。
+
+---
+
+## 1) 服务启动/依赖注入：应用是怎么“开机”的
+
+### `app.main:create_app()`
+
+* **功能**：创建 FastAPI 实例，挂 routers、CORS、lifespan。
+* **协作**：会读取配置 `get_settings()`，并把 API 路由按 `settings.api_prefix` 挂上（你之前遇到 `api_prefix/app_name` 缺失，就是这里在读配置字段）。
+
+### `app.core.config:get_settings()`
+
+* **功能**：用 `lru_cache` 缓存 Settings（测试里你们频繁 `get_settings.cache_clear()` 就是为了让环境变量生效）。
+* **协作**：所有地方（DB/LLM/上传限制/CORS）都从这里读配置。配置集中是为了迁移和部署。
+
+### `app.core.database:get_engine()` / `get_sessionmaker()` / `get_db()`
+
+* **功能**：
+
+  * `get_engine()`：返回全局 async engine（MySQL+aiomysql）。
+  * `get_sessionmaker()`：返回 AsyncSession 工厂。
+  * `get_db()`：FastAPI Depends 用的 DB session 依赖。
+* **协作**：API 层只管 `db: AsyncSession = Depends(get_db)`，业务逻辑放 services。
+
+### `app.core.database:shutdown_db()`
+
+* **功能**：释放 engine/连接池，测试里用于“重连到不同 DATABASE_URL”或避免资源泄漏。
+
+---
+
+## 2) 场景 A：健康检查（最小闭环）
+
+### `app.api.health_api:get_health()`（或类似）
+
+* **功能**：返回 `{"status":"ok"}`，用于证明服务启动、路由可达。
+* **协作**：不触 DB/LLM/文件，纯 API 自检（你们测试里有 `test_health_ok`）。
+
+---
+
+## 3) 场景 B：上传 Excel（POST `/api/excel/upload`）
+
+文档明确的核心接口之一：`POST /api/excel/upload`。
+
+### `app.api.excel_api:excel_upload()`（或 `upload_excel()`）
+
+按典型实现，这个函数会做 5 件事：
+
+1. **参数接收与校验**
+
+* 读取 `UploadFile`，检查扩展名/Content-Type，检查大小（用 `settings.max_upload_mb`）。
+* 失败场景：没传 file、不是 xlsx、超大小 → 直接 `HTTPException(400/413/422)`。
+
+2. **会话创建/绑定**
+
+* `ConversationService.create_session()`：新建 `sessions` 记录（`Session` model）。
+* 也可能是“前端传 session_id 则复用，否则创建”。
+
+3. **落盘存储**
+
+* `ExcelService.save_upload()` / `file_utils.save_upload_file()`
+
+  * 写到 `DATA_DIR` 下（需求里明确 “文件存储（本地或对象存储）”）。
+
+4. **入库 file_uploads**
+
+* `ExcelService.create_upload_record()`（或放在 ExcelService/ConversationService 里）
+
+  * 写 `file_uploads` 表：`upload_id、session_id、filename、stored_path、uploaded_at`。
+
+5. **返回给前端**
+
+* 典型返回：`{session_id, upload_id, filename,...}`
+
+### `app.services.excel_service:read_excel_to_df()`
+
+* **功能**：用 `pandas.read_excel(..., engine="openpyxl")` 把 Excel 读成 DataFrame。
+* **协作**：读取只做一次，后续 chat 不重复 IO（靠缓存）。
+
+### `app.services.excel_service:build_profile(df)`
+
+* **功能**：生成轻量概况：rows/cols/columns/缺失率/预览 head 等。
+* **协作**：用于：
+
+  * 给 Planner 判断列名、类型；
+  * 给 LLM system prompt 增加“数据边界”。
+
+### `app.services.excel_service:excel_cache[upload_id]=...` / `cache_df(upload_id, df, profile)`
+
+* **功能**：把 DataFrame 放在进程内缓存（你们文档明确 DataFrame 不入库）。 
+* **场景含义**：服务重启缓存会丢（这是当前设计选择），但 DB 中还保留 upload 记录与 stored_path，可以再读回来（如果你们实现了 ensure_cached）。
+
+---
+
+## 4) 场景 C：对话分析（POST `/api/excel/chat`）——本项目核心
+
+文档明确的第二个核心接口：`POST /api/excel/chat`。
+
+### `app.api.excel_api:excel_chat()`
+
+这层只做“请求编排”：**写用户消息 → 调 Agent → 写 assistant 消息 → 触发 summary → 返回**。
+
+#### 1) 写入 user message
+
+* `ConversationService.add_message(session_id, role="user", content=request.message, extra=...)`
+* DB 表：`messages`（含 summarized/token_count/extra）。
+
+#### 2) 进入智能编排
+
+* `AgentService.answer_excel_question(db, session_id, upload_id, question)`
+
+  * 这是“智能枢纽”。
+
+---
+
+## 5) AgentService：把“自然语言”变成“可复现的工具链 + 解释”
+
+下面这段就是你现在项目真正像 Agent 的原因：**先算，再说**。
+
+### `ExcelService.ensure_cached(db, upload_id)`
+
+* **功能**：
+
+  * 先看 `excel_cache` 里有没有 DataFrame；
+  * 没有则用 `file_uploads.stored_path` 读取并重新缓存。
+* **失败场景**：upload 不存在/文件丢了 → 返回 “upload_missing” 之类错误（你之前代码里就是这么返回的）。
+
+### `plan_tools(df, question) -> list[ToolCall]`
+
+* **功能**：把问题规划成多步工具调用（ToolCall 有 `name/args`）。
+* **典型场景**（来自你们需求里的“意图识别→pandas分析→生成解释”）：
+
+  * “总和/均值/最大/最小” → `sum_numeric` / `describe`
+  * “TopN” → `sort` + `head`
+  * “趋势” → `groupby_sum` + `sort_time/sort` + `chart_line` + `head`
+
+### `build_default_registry() -> ToolRegistry`
+
+* **功能**：注册所有可用工具（pandas 工具、图表工具、profile/head 等）。
+* **协作**：Planner 只产出 `tool_name`，真正执行靠 Registry 用 `reg.get(name)` 找函数。
+* 你们测试里出现过 `ValueError: tool already registered`，本质是**同名工具重复 register**（通常是 build_default_registry 被写成“全局单例 + 每次又重复注册”，或 register 没做覆盖策略）。
+
+### `ToolRegistry.register(name, fn)` / `ToolRegistry.get(name)`
+
+* **功能**：工具表的“字典封装”。
+* **协作**：Agent 执行时每一步：`fn = reg.get(call.name)` → `out = fn(current_df, **call.args)`。
+
+### `pandas_tools.* -> ToolResult`
+
+你们的工具统一返回 `ToolResult(kind, value, preview)`，这是为了：
+
+* **给下一步工具**：如果 `kind=="table"`，把 `value`（DataFrame）接着往下传；
+* **给 LLM**：用 `preview` 把结果变成短文本塞进 prompt；
+* **给前端**：如果 `kind=="chart"`，把 `value` 当图表 spec 放进 `artifacts`。
+
+常见工具（按你们测试/代码片段出现过的）：
+
+* `tool_profile(df)`：rows/cols/columns…（通常作为第 1 步，让 LLM/调试更清楚）
+* `tool_sum_numeric(df, col)`：输出总和（你们有断言要出现“30”）
+* `tool_groupby_sum(df, group_col, value_cols)`：分组求和（你刚让改的函数就在这里）
+* `tool_sort_time(df, time_col)` / `tool_sort(df, by, ascending)`：排序
+* `tool_head(df, n)`：取前 N 行
+* `tool_chart_line(df, x_col, y_cols)` 或 `tool_chart_line_index(df, y_cols)`：图表 spec（趋势图场景会产出 artifacts）
+
+### `AgentService._format_tool_results(trace) -> str`
+
+* **功能**：把每步工具输出合并成给 LLM 的“工具结果文本”（例如 `[Step 1] ...`）。
+* **协作**：这是你们“禁止编造”的关键：LLM 被要求**只基于 tool_result**回答。
+
+### `ConversationService.build_llm_context(db, session_id) -> list[messages]`
+
+* **功能**：拼上下文：**最新 summary + 最近未 summarized 的 N 条消息**。
+* **协作**：Agent 在发 LLM 前会取这个上下文，保证“多轮追问”还能衔接。
+
+### `get_llm_provider() -> LLMProvider`
+
+* **功能**：根据 `LLM_PROVIDER` 返回 `FakeLLMProvider` 或 `OpenAIProvider`（你正在从 fake 切到真实 API）。
+* **协作**：Agent 不关心具体供应商，调用统一接口 `provider.generate(system, user, tool_result)`。
+
+### `LLMProvider.generate(system, user, tool_result) -> str`
+
+* **功能**：生成最终 `reply` 文本。
+* **协作**：输入里最关键的是 `tool_result`（可复现计算结果）。
+
+### `AgentService.answer_excel_question(...) -> (reply, debug)`
+
+* **功能**：把上面全部串成一个事务：
+
+  1. ensure_cached 拿 df/profile
+  2. plan_tools 生成 ToolCalls
+  3. registry 执行工具链，产出 trace + artifacts
+  4. build_llm_context 拼上下文
+  5. llm.generate 出 reply
+  6. 返回 reply + debug（debug 内含 plan/tool_trace/artifacts/profile）
+
+---
+
+## 6) 回到 API：写 assistant message、触发 summary、返回响应
+
+### `ConversationService.add_message(role="assistant", extra={"debug":...})`
+
+* **功能**：把 reply 落库到 `messages`，并把 debug 存 `messages.extra`（JSON）。
+* **协作**：后续 “消息列表接口”/“前端渲染图表” 都靠 extra 里的 artifacts。
+
+### `SummaryService.maybe_generate_summary(session_id)`
+
+* **功能**：当累计 token 超阈值时，把旧消息压缩成 summary，并标记旧 messages 为 `summarized=True`。
+* **协作**：下一轮 build_llm_context 会带上 summary（节省 tokens）。
+
+### `ExcelChatResponse( reply, session_id, upload_id, artifacts=[] )`
+
+* **功能**：输出给前端。你们后来把 `artifacts` 设为 `default_factory=list`，就是为了保证前端/测试永远收到 list（非常关键）。
+
+---
+
+## 7) 其它你们已经覆盖到的“业务场景”（从测试能看出来）
+
+### 场景 D：趋势图 fallback（没有时间列）
+
+* Planner/工具链会走 `chart_line_index`（用行号当 x 轴）——这就是你们测试 `trend_without_time_uses_index_chart` 的意义：没时间列也能画“趋势”。
+
+### 场景 E：缺失值不被当 0
+
+* `chart` spec 里缺失值要保留 `null/None`，而不是用 0 填（你们有专门的缺失值测试）。
+
+### 场景 F：消息列表 API（用于前端回放）
+
+* 一般会有 `GET /api/sessions/{sid}/messages` 或类似接口：
+
+  * `ConversationService.list_messages(session_id)`：从 DB 取 messages；
+  * 把每条 `message.extra.debug.artifacts` 提取出来，方便前端渲染图表。
+
+---
+
